@@ -38,6 +38,16 @@ PROPOSED (DB layer is the correctness authority)
 
 ---
 
+## Confirmed Race Conditions
+
+| | Race | Scenario | Root cause |
+|---|---|---|---|
+| Race 1 | TOCTOU rename | Node A and Node B both check a name doesn't exist, both proceed — one rename silently wins or both succeed with duplicate names | No cross-node lock on parent namespace during check-then-write |
+| Race 3 | Orphaned child | `DROP SCHEMA` on Node A commits; Node B's `CREATE TABLE` under that schema also commits — `table_meta` row exists with a soft-deleted `schema_id` | No FK between `table_meta` and `schema_meta`; soft-delete + manual ID joins means the INSERT sees no constraint violation |
+| ABA | Lost update | Metalake at V1 → updated to V2 → reverted to V1-equivalent content; stale writer at V1 passes the `UPDATE WHERE old_value` OCC guard undetected | `POConverters` copies `lastVersion` to `nextVersion` without incrementing — version never advances, ABA cycle invisible to OCC |
+
+---
+
 ## Three Targeted Fixes
 
 | Fix | Race closed | Location |
