@@ -62,6 +62,18 @@ etcd per-write locking is only correct if a fencing token propagates to every DB
 
 ---
 
+## Agentic Workload Fit: OCC + Retry Is the Natural Pattern
+
+Gravitino increasingly serves multi-agent AI systems: LLM agents issuing concurrent DDL via tool calls, training pipelines registering model versions in parallel via `ModelMetaService`, inference servers reading schema metadata at serving time.
+
+**LLM agents have retry-with-backoff built into their tool call loops by design.** When an agent's `createTable` call returns a 409 Conflict (OCC failure), it retries — exactly as it would for any transient API error. OCC surfaces conflicts as retryable errors, which is what agents already expect. This is architectural fit, not just a performance tradeoff.
+
+Per-write distributed locks invert this: agents queue at lock acquisition *before* the DB write, serializing parallelism that multi-agent systems are designed to exploit. A 10-agent concurrent model registration storm that completes in ~50ms under OCC would serialize to 10 × (lock RTT + write) ≈ 300ms+ under etcd per-write locking — before any contention is even considered. Lock-free reads are essential for inference-time metadata lookup latency; a READ lock acquired from etcd before every `loadTable` is a non-starter.
+
+The 2026 field consensus (Iceberg REST v1.6+, Delta Lake Unity Catalog, Kafka KRaft) converges on the same point: push serialization into the storage layer via OCC; reserve external coordinators for coarse-grained topology only. Agentic workloads make this constraint sharper, not weaker.
+
+---
+
 ## Tradeoffs
 
 | Tradeoff | This proposal's choice | Rejected alternative |
