@@ -1,7 +1,7 @@
 version: "3.8"
 
 # Gravitino HA Correctness — Smoke Test Environment
-# Companion to: docs/superpowers/specs/2026-05-17-gravitino-ha-test-harness.md
+# Companion to: docs/treelock-ha/2026-05-17-gravitino-ha-test-harness.md
 #
 # Two Gravitino nodes sharing one PostgreSQL entity store and all catalog backends.
 # Follows the network and naming conventions of:

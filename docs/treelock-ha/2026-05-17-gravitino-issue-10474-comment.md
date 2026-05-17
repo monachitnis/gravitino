@@ -4,9 +4,9 @@
 
 ---
 
-## A DB-Native Approach: Three Targeted Fixes, No New Dependencies
+## A DB-Native Approach: Three Targeted Fixes, Phased approach to external HA cluster
 
-The prior proposals (etcd/ZK distributed lock, remove TreeLock + OCC, partition ownership + watchdog, DB lease table, LockBackend SPI) each identify a real problem but treat TreeLock replacement as the solution. This proposal takes a different position: **if the DB already provides ACID transactions and OCC, TreeLock is a correct single-server in-memory optimization — the HA correctness gaps are three specific DB-layer omissions**.
+The prior proposals (etcd/ZooKeeper distributed lock, remove TreeLock + OCC, partition ownership + watchdog, DB lease table, LockBackend SPI) each identify a real problem but treat TreeLock replacement as the solution. This proposal takes a different position: **if the DB already provides ACID transactions and OCC, TreeLock is a correct single-server in-memory optimization — the HA correctness gaps are three specific DB-layer omissions**.
 
 ```
 ─────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ The DB row lock acquired by `SELECT ... FOR UPDATE` is held by the DB connection
 - **GPU→CPU PCIe offload stalls**: In AI inference deployments, GPU memory pressure causes host memory offloads over PCIe, stalling CPU threads coordinating metadata reads via Gravitino. DB connection lock is unaffected by the JVM thread's scheduling state.
 - **GC pauses**: Java 21 ZGC/Shenandoah gives sub-millisecond pause times — Kleppmann's motivating 30-second G1GC pause is largely historical on modern JVMs. `SELECT FOR UPDATE` is immune regardless.
 
-Contrast with etcd/ZK per-write locking: a JVM stall can expire the lease. The storage layer has no mechanism to reject the stale write unless a fencing token is propagated to every DB write — at which point the external coordinator is doing no work that `SELECT FOR UPDATE` doesn't already do.
+Contrast with etcd/ZooKeeper per-write locking: a JVM stall can expire the lease. The storage layer has no mechanism to reject the stale write unless a fencing token is propagated to every DB write — at which point the external coordinator is doing no work that `SELECT FOR UPDATE` doesn't already do.
 
 ---
 
@@ -83,7 +83,7 @@ This section documents the tradeoffs evaluated and why this proposal lands where
 
 **`SELECT FOR UPDATE` cost**: Structural operations (createTable, dropSchema, renameTable) are DDL — rare relative to reads. The parent row lock is held for the duration of a single DB transaction (typically < 5ms for a metadata write). Under high DDL concurrency, waiting threads queue at the DB row lock, which is handled by the DB's lock manager with known, bounded wait semantics. This is the same mechanism used by every relational system for concurrent writes.
 
-**External coordinator cost**: etcd or ZK per-write locking requires one network round-trip per hierarchy level before any DB work begins. For a 4-level path: 4 × 2–5ms = 8–20ms overhead per write, plus keepalive background traffic, plus the coordinator cluster's own HA. This overhead is always paid — even on uncontested writes, even for reads that happen to acquire a READ lock.
+**External coordinator cost**: etcd or ZooKeeper per-write locking requires one network round-trip per hierarchy level before any DB work begins. For a 4-level path: 4 × 2–5ms = 8–20ms overhead per write, plus keepalive background traffic, plus the coordinator cluster's own HA. This overhead is always paid — even on uncontested writes, even for reads that happen to acquire a READ lock.
 
 **Conclusion**: For Gravitino's DDL-sparse, read-heavy, metadata workload, `SELECT FOR UPDATE` contention is negligible and the coordinator overhead is not. The tradeoff favors DB-native locking unless write contention on individual parent rows becomes measurable — which is a data-driven threshold, not a speculative one.
 
@@ -176,7 +176,7 @@ Phase D (future — active-active, optional) ───────────�
 Phase E (future — embedded coordination, optional) ──────────────
   Deliverable: Zero external runtime dependencies for HA
   ┌─────────────────────────────────────────────────────────────┐
-  │  KRaft-style embedded Raft in Gravitino nodes               │
+  │  KafkaRaft-style embedded Raft in Gravitino nodes           │
   │  controller_epoch derived from embedded log offset          │
   │  Eliminates etcd operational dependency                     │
   └─────────────────────────────────────────────────────────────┘
@@ -192,7 +192,7 @@ Phase E (future — embedded coordination, optional) ─────────
 
 ## Why Not the Other Proposals
 
-**Option A (etcd/ZK per-write)**: Conflates topology management with per-write locking. etcd and ZK are the right tools for Phase C (leader election, coarse-grained, per-failover). They are the wrong tools for per-write structural op serialization — that is Phase A's job, solved more cheaply and more safely by the DB's own row locking. Using etcd per-write also locks in external coordinator dependency before it's needed, skipping directly to the most operationally complex topology.
+**Option A (etcd/ZooKeeper per-write)**: Conflates topology management with per-write locking. etcd and ZooKeeper are the right tools for Phase C (leader election, coarse-grained, per-failover). They are the wrong tools for per-write structural op serialization — that is Phase A's job, solved more cheaply and more safely by the DB's own row locking. Using etcd per-write also locks in external coordinator dependency before it's needed, skipping directly to the most operationally complex topology.
 
 **Option B (delete TreeLock + OCC)**: Correct direction. Race 3 (orphaned child) is unaddressed without `SELECT FOR UPDATE`; this proposal completes Option B's intent. Deleting TreeLock removes correct intra-node serialization with zero benefit — TreeLock's in-memory operation has no cross-node visibility to break.
 
@@ -200,7 +200,7 @@ Phase E (future — embedded coordination, optional) ─────────
 
 **Counter-proposal (new lease table)**: `SELECT FOR UPDATE` on the existing parent entity row is strictly simpler — no schema migration, no new table, no new background thread for lease renewal, and it simultaneously verifies parent existence (closing Race 3), which the lease table does not.
 
-**PR #11020 (LockBackend SPI)**: Valuable extensibility work that this proposal complements rather than replaces. The correctness gaps are in the DB layer (Phase A), not the lock layer. PR #11020's Phase B (OCC in `RelationalEntityStore`) is what this proposal delivers directly. The SPI abstraction becomes more valuable once Phase C (etcd) and Phase E (embedded Raft) are in scope — operators can select the appropriate backend for their topology.
+**PR #11020 (LockBackend SPI)**: The SPI abstraction becomes more valuable once Phase C (etcd) and Phase E (embedded Raft) are in scope — operators can select the appropriate backend for their topology.
 
 ---
 
@@ -208,7 +208,29 @@ Phase E (future — embedded coordination, optional) ─────────
 
 Gravitino increasingly serves multi-agent AI systems: LLM agents issuing concurrent DDL via tool calls, model training pipelines registering versions concurrently via `ModelMetaService`, inference servers reading schema metadata at serving time. OCC + retry is the natural pattern — agents already implement retry with backoff. Per-write distributed locks (Phase A skipped in favor of etcd per-write) would serialize parallel agents at lock acquisition, destroying multi-agent concurrency. Lock-free reads are essential for inference-time metadata lookup latency.
 
-The 2026 field consensus (Iceberg REST v1.6+, Delta Lake Unity Catalog GA Feb 2026, Kafka KRaft March 2025) converges on the same conclusion: push correctness into the storage layer via OCC and version columns; reserve external coordinators for coarse-grained topology management only. This proposal follows that pattern exactly.
+The 2026 field consensus (Iceberg REST v1.6+, Delta Lake Unity Catalog GA Feb 2026, Kafka KafkaRaft March 2025) converges on the same conclusion: push correctness into the storage layer via OCC and version columns; reserve external coordinators for coarse-grained topology management only. This proposal follows that pattern exactly.
+
+---
+
+## Agentic Contribution: A Reusable Skill for Future Contributors
+
+This proposal was developed using an agentic coding workflow — not just as a document but as a machine-readable knowledge artifact. As part of this contribution, a **`gravitino-locking-reviewer` Claude Code skill** has been added to the fork:
+
+```
+.claude/skills/gravitino-locking-reviewer/SKILL.md
+```
+
+The skill encodes Gravitino's distributed state management discipline into an **invocable code review checklist** for AI-assisted development. It covers:
+
+- **TreeLock pattern verification** — correct identifier level and lock type for each operation class (create/drop/rename/read/alter), cross-schema rename lock promotion rules
+- **DB-layer serialization review** — `SELECT FOR UPDATE` placement within `SessionUtils.doWithCommit`, parent existence re-check after lock, unique constraint presence
+- **OCC version correctness** — monotonic increment check, ABA detection, conflict surfacing as `OccConflictException`
+- **Cache coherence audit** — `EntityChangeLog` write coverage, `invalidateByPrefix` scope for parent-level deletes, dispatch table for all entity + operation combinations
+- **Leader election and epoch fencing** — epoch monotonicity, storage-layer epoch check, split-brain window bounds
+
+**What this enables in practice**: A contributor writing a new `MetaService` structural operation can invoke `/gravitino-locking-reviewer` and receive a structured analysis of whether the code upholds the five invariants before a human reviewer sees it. Reviewers can invoke the same skill to generate a checklist-grounded review, not a pattern-matched one.
+
+This is an attempt to demonstrate what **AI-amplified OSS contribution** looks like in 2026: not just AI-generated text, but AI-invocable knowledge that makes the *next* contribution safer. The skill references the design docs on this fork branch; if the proposal lands and the docs move to the main repo, the skill can be updated in place.
 
 ---
 
@@ -226,13 +248,14 @@ The 2026 field consensus (Iceberg REST v1.6+, Delta Lake Unity Catalog GA Feb 20
 
 ---
 
-## Full Specification
+## Full Spec
 
 Available on fork branch [`monachitnis/gravitino:docs/locking-deep-dive-and-ha-design`](https://github.com/monachitnis/gravitino/tree/docs/locking-deep-dive-and-ha-design):
 
 | Document | Contents |
 |----------|----------|
-| `docs/superpowers/specs/2026-05-17-gravitino-ha-locking-proposal-final.md` | Full design doc: confirmed bugs with line numbers, prior proposal verdict table, 2026 ecosystem lens, architecture diagrams, migration phases |
-| `docs/superpowers/specs/2026-05-17-gravitino-ha-implementation-spec.md` | Implementation contracts: `SELECT FOR UPDATE` mapper interfaces, version increment fix audit, `EntityChangeLogPoller` SPI, `GravitinoLeaderElection` etcd SPI |
-| `docs/superpowers/specs/2026-05-17-gravitino-ha-test-harness.md` | Integration test specification: 6 correctness scenarios across Hive/Iceberg/Kafka/JDBC/Paimon data planes, `HaBaseIT` base class contract |
-| `docs/superpowers/specs/docker/docker-compose-ha-test.yml` | Docker Compose for HA smoke tests: 2 Gravitino nodes, shared PostgreSQL, etcd, all catalog backends |
+| `docs/treelock-ha/2026-05-17-gravitino-ha-locking-proposal-final.md` | Full design doc: confirmed bugs with line numbers, prior proposal verdict table, 2026 ecosystem lens, architecture diagrams, migration phases |
+| `docs/treelock-ha/2026-05-17-gravitino-ha-implementation-spec.md` | Implementation contracts: `SELECT FOR UPDATE` mapper interfaces, version increment fix audit, `EntityChangeLogPoller` SPI, `GravitinoLeaderElection` etcd SPI |
+| `docs/treelock-ha/2026-05-17-gravitino-ha-test-harness.md` | Integration test specification: 6 correctness scenarios across Hive/Iceberg/Kafka/JDBC/Paimon data planes, `HaBaseIT` base class contract |
+| `docs/treelock-ha/docker/docker-compose-ha-test.yml` | Docker Compose for HA smoke tests: 2 Gravitino nodes, shared PostgreSQL, etcd, all catalog backends |
+| `.claude/skills/gravitino-locking-reviewer/SKILL.md` | Claude Code skill: invocable code review checklist for distributed state management, TreeLock patterns, OCC, EntityChangeLog, and leader election |

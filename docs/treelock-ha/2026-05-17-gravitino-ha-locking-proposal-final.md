@@ -220,27 +220,13 @@ etcd handles **only** the HA topology question — which node is active. It fire
 
 The active node's etcd `CreateRevision` (a Raft-committed, globally monotonic integer) is stored as `controller_epoch` in the entity store on activation. Every structural write includes `AND controller_epoch = #{currentEpoch}` in its WHERE clause. A stale node that resumes after a failover has an outdated epoch — its writes are rejected by the DB predicate without any coordinator round-trip.
 
-This gives Kleppmann's fencing token guarantee using the existing DB as the enforcement point, with zero per-write overhead from etcd.
+This gives fencing token guarantee using the existing DB as the enforcement point, with no per-write overhead from etcd.
 
 **Active-active (long-term)**: Fix 1 (`SELECT FOR UPDATE`) already provides the correctness foundation for multi-master. No additional coordination mechanism needed — the DB transaction IS the cross-node serializer.
 
 ---
 
-## 5. How This Improves on Each Prior Proposal
-
-**vs Option A (etcd/ZK per-write)**: This proposal uses etcd only for leader election (fires on failover), not for per-write locking. The per-write serialization is provided by `SELECT FOR UPDATE` inside the DB transaction — zero RTT overhead, immune to the same failure modes (CPU throttle, GPU offload stall) that would expire an etcd lease.
-
-**vs Option B (delete TreeLock + OCC)**: This proposal retains TreeLock (correct, zero-overhead for intra-node) and adds the parent `SELECT FOR UPDATE` that Option B omits. Option B correctly identified OCC as the right direction; this proposal completes it.
-
-**vs Option C (partition + watchdog + trigger)**: This proposal provides the same DB-layer fencing without the operational complexity. The `SELECT FOR UPDATE` + DB transaction IS the trigger — no separate trigger mechanism, no watchdog threads, no partition routing, no `System.exit()` blast radius, no `(tree_version, owner_node)` identity gap.
-
-**vs Counter-proposal (new lease table)**: `SELECT FOR UPDATE` on the existing parent entity row is strictly simpler — no new table, no new schema migration, and simultaneously verifies parent existence (closes Race 3) which the lease table approach does not.
-
-**vs PR #11020 (LockBackend SPI)**: The SPI is a useful extensibility mechanism for future backends. This proposal delivers the correctness fixes that PR #11020's Phase B defers, directly in the DB layer where they belong. The SPI and this proposal are complementary — the SPI can wrap the fixed behavior.
-
----
-
-## 6. Migration Phases
+## 5. Migration Phases
 
 **Phase A — DB correctness (this proposal, no new dependencies)**
 - Fix 1: `SELECT FOR UPDATE` on parent rows in all structural meta services
@@ -260,6 +246,19 @@ This gives Kleppmann's fencing token guarantee using the existing DB as the enfo
 
 ---
 
+## 6. How This Improves on Each Prior Proposal
+
+**vs Option A (etcd/ZK per-write)**: This proposal uses etcd only for leader election (fires on failover), not for per-write locking. The per-write serialization is provided by `SELECT FOR UPDATE` inside the DB transaction — zero RTT overhead, immune to the same failure modes (CPU throttle, GPU offload stall) that would expire an etcd lease.
+
+**vs Option C (partition + watchdog + trigger)**: This proposal provides the same DB-layer fencing without the operational complexity. The `SELECT FOR UPDATE` + DB transaction IS the trigger — no separate trigger mechanism, no watchdog threads, no partition routing, no `System.exit()` blast radius, no `(tree_version, owner_node)` identity gap.
+
+**vs Counter-proposal (new lease table)**: `SELECT FOR UPDATE` on the existing parent entity row is strictly simpler — no new table, no new schema migration, and simultaneously verifies parent existence (closes Race 3) which the lease table approach does not.
+
+**vs PR #11020 (LockBackend SPI)**: The SPI is a useful extensibility mechanism for future backends. This proposal delivers the correctness fixes that PR #11020's Phase B defers, directly in the DB layer where they belong. The SPI and this proposal are complementary — the SPI can wrap the fixed behavior.
+
+---
+
+
 ## 7. Open Questions for Community
 
 1. **DB isolation level assumption**: `SELECT FOR UPDATE` on a `deleted_at = 0` predicate relies on the DB seeing committed state at lock time. PostgreSQL `READ COMMITTED` (default) provides this. MySQL `REPEATABLE READ` (default) reads a snapshot — a `FOR UPDATE` on MySQL reads the current committed version even in RR mode, so behavior is correct on both. Worth explicitly documenting the supported isolation levels.
@@ -276,9 +275,8 @@ This gives Kleppmann's fencing token guarantee using the existing DB as the enfo
 
 ## References
 
-- Full codebase analysis: `docs/superpowers/specs/2026-05-17-gravitino-locking-deep-dive.md`
-- Initial option analysis: `docs/superpowers/specs/2026-05-17-gravitino-ha-locking-design.md`
-- Implementation specification: `docs/superpowers/specs/2026-05-17-gravitino-ha-implementation-spec.md`
-- Test harness: `docs/superpowers/specs/2026-05-17-gravitino-ha-test-harness.md`
-- Kleppmann: "How to do distributed locking" (2016) — `martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html`
+- Full codebase analysis: `docs/treelog-ha/2026-05-17-gravitino-locking-deep-dive.md`
+- Initial option analysis: `docs/treelog-ha/2026-05-17-gravitino-ha-locking-design.md`
+- Implementation specification: `docs/treelog-ha/2026-05-17-gravitino-ha-implementation-spec.md`
+- Test harness: `docs/treelog-ha/2026-05-17-gravitino-ha-test-harness.md`
 - DDIA: Chapters 8–9 (Kleppmann, O'Reilly 2017)

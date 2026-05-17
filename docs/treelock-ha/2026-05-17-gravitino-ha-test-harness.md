@@ -436,7 +436,7 @@ enum TestCatalogType {
 
 ## Docker Compose — HA Smoke Test Environment
 
-See `docs/superpowers/specs/docker/docker-compose-ha-test.yml`.
+See `docs/treelock-ha/docker/docker-compose-ha-test.yml`.
 
 Key design decisions:
 - Both Gravitino nodes share the same `postgres` service (entity store)

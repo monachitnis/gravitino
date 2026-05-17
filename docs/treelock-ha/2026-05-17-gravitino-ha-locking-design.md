@@ -1,6 +1,6 @@
 # Design Doc: Distributed Concurrency for Multi-Server Gravitino (Issue #10474)
 
-**Status**: Draft — for community discussion. No approach is recommended; both options are presented for review.
+**Status**: Draft — for community discussion. Options are presented for review - before final implementation.
 **Issue**: https://github.com/apache/gravitino/issues/10474
 **Date**: 2026-05-17
 
