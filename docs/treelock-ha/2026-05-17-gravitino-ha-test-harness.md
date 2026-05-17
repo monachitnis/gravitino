@@ -447,6 +447,139 @@ Key design decisions:
 
 ---
 
+## Gravitino Playground Integration
+
+The hermetic CI tests (`HaBaseIT` + `MiniGravitino`) verify correctness in isolation. The [gravitino-playground](https://github.com/apache/gravitino-playground) adds a second testing tier: full data plane fidelity with real catalog backends, interactive Jupyter-based beta validation, and Prometheus/Grafana observability — without standing up new infrastructure.
+
+### Two Testing Modes
+
+| Mode | Infrastructure | When to use |
+|---|---|---|
+| **CI (hermetic)** | `MiniGravitino` × 2 + TestContainers PG | Every PR, fast, deterministic |
+| **Playground staging** | playground compose + HA overlay | Pre-release beta, customer staging, perf baseline |
+
+### Playground Overlay Pattern
+
+The playground (`docker-compose.yaml`) provides Hive, MySQL, PostgreSQL, Spark, Trino, Jupyter, Prometheus, Grafana. The HA overlay adds only a second Gravitino node and etcd:
+
+**`docs/treelock-ha/docker/docker-compose-ha-overlay.yml`**:
+```yaml
+# Extends gravitino-playground/docker-compose.yaml
+# Adds: gravitino-node-b (same image, shared entity store) + etcd
+services:
+  gravitino-node-b:
+    image: apache/gravitino:${GRAVITINO_IMAGE_TAG}
+    container_name: playground-gravitino-node-b
+    ports:
+      - "8091:8090"
+    environment:
+      - GRAVITINO_NODE_ID=node-b
+      - GRAVITINO_ENTITY_STORE_JDBC_URL=jdbc:postgresql://postgresql:5432/db
+      - GRAVITINO_CACHE_ENTITY_CHANGELOG_ENABLED=true
+      - GRAVITINO_CACHE_ENTITY_CHANGELOG_POLL_INTERVAL_MS=500
+    depends_on:
+      gravitino:
+        condition: service_healthy    # node-a healthy first
+      etcd:
+        condition: service_healthy
+    volumes:
+      - ./init/gravitino:/tmp/gravitino
+      - ./healthcheck:/tmp/healthcheck
+
+  etcd:
+    image: bitnami/etcd:3.5
+    container_name: playground-etcd
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+    ports:
+      - "2379:2379"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+```
+
+**Start command**:
+```bash
+cd gravitino-playground
+docker compose \
+  -f docker-compose.yaml \
+  -f ../gravitino/docs/treelock-ha/docker/docker-compose-ha-overlay.yml \
+  up --wait
+```
+
+Both nodes now share the same PostgreSQL entity store and all catalog backends. This is the exact topology that exercises Race 1 and Race 3.
+
+---
+
+### Jupyter Beta Validation
+
+The playground's existing notebooks are extended with HA race scenario cells. No new notebook infrastructure required — extend in-place.
+
+| Notebook | Extension | Scenario covered |
+|---|---|---|
+| `gravitino-spark-trino-example.ipynb` | Add cells: concurrent Python REST calls to `gravitino:8090` and `gravitino-node-b:8091` racing `createTable` and `dropSchema` | Scenarios 1, 2 (Race 1, Race 3) |
+| `gravitino_llamaIndex_demo.ipynb` | Add cells: 10 parallel LlamaIndex agent calls registering model versions across both nodes | Scenario 5 (AI agent storm) |
+| `gravitino-trino-example.ipynb` | Add cells: Trino DDL via Node A while Node B drops the schema concurrently | Scenario 6 (Hive data plane) |
+
+These notebooks serve as **interactive beta test scripts** for OSS contributors and managed deployment operators validating a release candidate before rollout. They exercise the full stack — REST API, MetaService, catalog plugin, underlying data plane — in a way that hermetic unit tests cannot.
+
+---
+
+### Observability: HA Metrics on Existing Grafana
+
+The playground already ships Prometheus scraping Gravitino metrics (`prometheus.yml` → port 9001) and Grafana pre-configured with a Prometheus datasource. Three HA-specific panels to add:
+
+**Panel 1 — OCC retry rate**
+```promql
+rate(gravitino_occ_conflict_total[5m])
+```
+Expected behavior after Phase A ships: spikes during concurrent DDL storms, then resolves — confirms serialization is working. A sustained high rate indicates unexpected write contention.
+
+**Panel 2 — EntityChangeLog poll lag**
+```promql
+gravitino_entitychangelog_max_id - gravitino_entitychangelog_last_consumed_id
+```
+Tracks how far behind each node's cache poller is. Should stay near zero at 500ms poll interval. Sustained lag indicates DB write volume outpacing the consumer — a signal to tune poll interval or batch size.
+
+**Panel 3 — Structural op P99 latency**
+```promql
+histogram_quantile(0.99, rate(gravitino_structural_op_duration_seconds_bucket[5m]))
+```
+Baseline before Phase A (no `FOR UPDATE`), then measured after. Expected delta: ~3–8ms for the DB row lock acquisition under contention. This is the data that validates — or challenges — the "~5ms DDL txn" claim in the tradeoff table.
+
+---
+
+### Staged Rollout for Revenue-Sensitive Deployments
+
+For managed Gravitino deployments serving customers with SLA obligations:
+
+```
+Phase A  Drop-in — no topology change
+         Ships as a patch to existing single-node deployments
+         All existing behavior preserved; only adds FOR UPDATE and version increment
+         Zero rollout risk: no feature flag needed
+
+Phase B  Opt-in via feature flag
+         gravitino.cache.entityChangeLog.enabled=false (default)
+         Dark-launch in staging: enable for internal traffic first
+         Monitor EntityChangeLog poll lag panel before enabling per tenant
+         Rollback: set flag to false, no data loss, cache reverts to write-only invalidation
+
+Phase C  New runtime dependency (etcd)
+         Validate in playground overlay before any production cluster
+         Enable per-deployment, not globally — one cluster at a time
+         Rollback: disable etcd config → node falls back to single-writer Phase B behavior
+         Do not remove Phase C feature flag until stable across full customer base
+```
+
+The three-tier pipeline (CI → playground staging → production) maps to the standard progression: catch correctness bugs in CI, catch integration bugs in staging, catch scale/ops bugs in production canary.
+
+---
+
 ## Fixture Summary
 
 | Class | Scenarios | Notes |

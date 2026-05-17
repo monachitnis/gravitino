@@ -4,7 +4,7 @@
 
 ---
 
-## A DB-Native Approach: Three Targeted Fixes + Phased Topology
+## A DB-Native Approach: Three Targeted Fixes + Phased Topology for HA cluster
 
 The prior proposals treat TreeLock replacement as the solution. Different position: **TreeLock is correct for intra-node concurrency — the HA correctness gaps are three specific DB-layer omissions.**
 
@@ -126,6 +126,49 @@ It encodes Gravitino's distributed state discipline as an invocable code review 
 
 ---
 
+## Validation Pipeline: CI → Playground Staging → Managed Rollout
+
+For revenue-sensitive deployments, correctness fixes must ship with staged confidence — not just passing CI.
+
+**Tier 1 — Hermetic CI** (`HaBaseIT` + `MiniGravitino` + TestContainers):
+Two in-process Gravitino nodes, shared PostgreSQL, 6 correctness scenarios. Runs on every PR touching `MetaService`, `POConverters`, `EntityChangeLog`, or locking code. Fast, no external deps.
+
+**Tier 2 — Playground staging** (full data plane fidelity):
+[gravitino-playground](https://github.com/apache/gravitino-playground) ships Hive, MySQL, PostgreSQL, Spark, Trino, Prometheus, and Grafana as a single `docker compose up`. A thin overlay converts it into a 2-node HA cluster:
+
+```bash
+docker compose \
+  -f gravitino-playground/docker-compose.yaml \
+  -f docs/treelock-ha/docker/docker-compose-ha-overlay.yml up
+```
+
+The overlay (`docker-compose-ha-overlay.yml`) adds only `gravitino-node-b` (same image, shared entity store) and a single-node `etcd`. All catalog backends — Hive metastore, Iceberg REST, MySQL, PostgreSQL — are shared between both nodes. This is the exact topology that surfaces Race 1 and Race 3. No new infra to stand up.
+
+**Interactive beta validation via Jupyter**: Playground's existing `gravitino-spark-trino-example.ipynb` is extended with HA race scenario cells — concurrent Python REST calls racing DDL across both nodes. `gravitino_llamaIndex_demo.ipynb` (already in playground) directly exercises the AI agent model-registration storm (Scenario 5). OSS contributors and beta customers run these before a release cut.
+
+**Observability without new infra**: Playground's Prometheus + Grafana are already wired. Three HA-specific metrics to add as a dashboard:
+
+| Metric | Signal |
+|---|---|
+| OCC retry rate | Spikes after Phase A ships → confirms `FOR UPDATE` is serializing correctly |
+| EntityChangeLog poll lag (`maxId - lastConsumedId`) | Confirms Phase B consumer is keeping up; alerts if falling behind |
+| Structural op P99 latency | Baseline before / after `FOR UPDATE` — quantifies the ~5ms DDL overhead claimed in the tradeoff table |
+
+**Staged rollout for managed deployments**:
+
+```
+Phase A  Drop-in correctness fix — zero topology change, safe for all existing deployments
+Phase B  Opt-in: gravitino.cache.entityChangeLog.enabled=false default
+         → dark-launch in staging, flip per tenant when validated
+Phase C  New dep (etcd): validate in playground overlay before enabling in production cluster
+         Rollback path: disable etcd → falls back to Phase B behavior, single active writer
+         Feature flag per deployment; no flag removal until Phase C is stable across customer base
+```
+
+Phase A ships with no rollout risk. Phases B and C are gated behind feature flags with explicit rollback paths — the pattern appropriate for production systems with SLA obligations.
+
+---
+
 ## Open Questions
 
 1. **DB isolation level**: `FOR UPDATE` on `READ COMMITTED` (PG default) and `REPEATABLE READ` (MySQL/InnoDB default) both read current committed rows for locked queries — should be documented explicitly per supported DB.
@@ -145,5 +188,6 @@ It encodes Gravitino's distributed state discipline as an invocable code review 
 | `docs/treelock-ha/2026-05-17-gravitino-ha-locking-proposal-final.md` | Full design: confirmed bugs, prior proposal verdicts, 2026 ecosystem lens, architecture diagrams, migration phases |
 | `docs/treelock-ha/2026-05-17-gravitino-ha-implementation-spec.md` | Implementation contracts: mapper interfaces, version increment audit, `EntityChangeLogPoller` SPI, `GravitinoLeaderElection` etcd SPI |
 | `docs/treelock-ha/2026-05-17-gravitino-ha-test-harness.md` | Integration test spec: 6 correctness scenarios across Hive/Iceberg/Kafka/JDBC/Paimon, `HaBaseIT` base class |
-| `docs/treelock-ha/docker/docker-compose-ha-test.yml` | Docker Compose: 2 Gravitino nodes, shared PostgreSQL, etcd, all catalog backends |
+| `docs/treelock-ha/docker/docker-compose-ha-test.yml` | Standalone HA compose: 2 Gravitino nodes, shared PostgreSQL, etcd, all catalog backends |
+| `docs/treelock-ha/docker/docker-compose-ha-overlay.yml` | Playground overlay: adds `gravitino-node-b` + `etcd` on top of existing playground stack |
 | `.claude/skills/gravitino-locking-reviewer/SKILL.md` | Claude Code skill: invocable distributed state review checklist |

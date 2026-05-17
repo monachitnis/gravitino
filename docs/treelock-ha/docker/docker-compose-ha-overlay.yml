@@ -1,0 +1,116 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# HA overlay for gravitino-playground.
+#
+# Extends gravitino-playground/docker-compose.yaml with a second Gravitino node
+# and a single-node etcd — converting the playground into a 2-node HA cluster.
+#
+# Usage:
+#   cd gravitino-playground
+#   docker compose \
+#     -f docker-compose.yaml \
+#     -f ../gravitino/docs/treelock-ha/docker/docker-compose-ha-overlay.yml \
+#     up --wait
+#
+# Both nodes share: playground's PostgreSQL entity store, Hive metastore,
+# MySQL, Iceberg REST, Spark, Trino. This is the topology that exercises
+# Race 1 (TOCTOU rename) and Race 3 (orphaned child on concurrent drop+create).
+#
+# Node A: playground-gravitino (port 8090) — from base compose, unchanged
+# Node B: playground-gravitino-node-b (port 8091) — added by this overlay
+# etcd:   playground-etcd (port 2379) — leader election only, zero per-write overhead
+
+services:
+
+  # Node B — same image as Node A, different port, shared entity store
+  gravitino-node-b:
+    image: apache/gravitino:${GRAVITINO_IMAGE_TAG}
+    container_name: playground-gravitino-node-b
+    entrypoint: /bin/bash /tmp/gravitino/init.sh
+    ports:
+      - "8091:8090"
+      - "9002:9001"
+    container_name: playground-gravitino-node-b
+    environment:
+      - GRAVITINO_NODE_ID=node-b
+      # Shared entity store — same PostgreSQL as Node A
+      - GRAVITINO_ENTITY_STORE=relational
+      - GRAVITINO_ENTITY_STORE_RELATIONAL_JDBC_URL=jdbc:postgresql://postgresql:5432/db
+      - GRAVITINO_ENTITY_STORE_RELATIONAL_JDBC_DRIVER=org.postgresql.Driver
+      - GRAVITINO_ENTITY_STORE_RELATIONAL_JDBC_USER=postgres
+      - GRAVITINO_ENTITY_STORE_RELATIONAL_JDBC_PASSWORD=postgres
+      # EntityChangeLog consumer — Phase B cache coherence
+      - GRAVITINO_CACHE_ENTITY_CHANGELOG_ENABLED=true
+      - GRAVITINO_CACHE_ENTITY_CHANGELOG_POLL_INTERVAL_MS=500
+      # etcd leader election — Phase C topology
+      - GRAVITINO_HA_ETCD_ENDPOINTS=http://etcd:2379
+      - GRAVITINO_HA_LEASE_TTL_SECONDS=10
+      - HIVE_HOST_IP=hive
+    depends_on:
+      gravitino:
+        condition: service_healthy    # node-a must be healthy first (bootstraps entity store)
+      etcd:
+        condition: service_healthy
+    volumes:
+      - ./healthcheck:/tmp/healthcheck
+      - ./init/gravitino:/tmp/gravitino
+    healthcheck:
+      test: ["CMD", "/tmp/healthcheck/gravitino-healthcheck.sh"]
+      interval: 5s
+      timeout: 60s
+      retries: 5
+      start_period: 20s
+    networks:
+      - gravitino-network
+
+  # Single-node etcd for leader election
+  # Production: replace with 3-node cluster for quorum
+  etcd:
+    image: bitnami/etcd:3.5
+    container_name: playground-etcd
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_DATA_DIR=/etcd-data
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - gravitino-network
+
+  # Extend Node A to also connect to etcd
+  gravitino:
+    environment:
+      - GRAVITINO_HA_ETCD_ENDPOINTS=http://etcd:2379
+      - GRAVITINO_HA_LEASE_TTL_SECONDS=10
+      - GRAVITINO_CACHE_ENTITY_CHANGELOG_ENABLED=true
+      - GRAVITINO_CACHE_ENTITY_CHANGELOG_POLL_INTERVAL_MS=500
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+volumes:
+  etcd-data:
